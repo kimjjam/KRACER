@@ -1,9 +1,22 @@
 // src/lib/socket.ts
 import { io } from "socket.io-client";
 
-// 서버 주소는 필요에 따라 .env로 뺄 수 있음
-export const socket = io("http://localhost:4000", {
-  transports: ["websocket"],
+// 배포(Render)는 REACT_APP_SOCKET_URL을 사용, 로컬 개발은 localhost로
+const PROD_URL = (process.env.REACT_APP_SOCKET_URL || "").replace(/\/$/, "");
+const DEV_URL = "http://localhost:4000";
+
+// 프로덕션에서 환경변수 없으면 콘솔 경고(안전장치)
+if (process.env.NODE_ENV === "production" && !PROD_URL) {
+  // eslint-disable-next-line no-console
+  console.warn("REACT_APP_SOCKET_URL is not set. Falling back to DEV_URL (will fail on Render).");
+}
+
+const BASE_URL =
+  process.env.NODE_ENV === "production" && PROD_URL ? PROD_URL : (PROD_URL || DEV_URL);
+
+export const socket = io(BASE_URL, {
+  transports: ["websocket"],   // 바로 wss로 연결
+  withCredentials: false,
 });
 
 // 공용 타입(서버 ack 형태에 맞춤)
