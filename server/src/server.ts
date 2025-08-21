@@ -4,6 +4,9 @@ import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 
+/** ─────────────────────────────────────────────────────────────
+ *  Types
+ *  ────────────────────────────────────────────────────────────*/
 type Team = "A" | "B";
 type Status = "waiting" | "playing" | "ended";
 type Visibility = "public" | "private";
@@ -14,11 +17,9 @@ type Player = {
   team?: Team;
   color?: string;
   ready: boolean;
-  health?: number; // 체력 추가
-  wins?: number; // 🆕 라운드 승리 스택
-  // 🆕 활성 증강: augmentId -> { id, startedAt }
+  health?: number; // 체력
+  wins?: number;   // 라운드 승리 스택
   augments?: Record<string, { id: string; startedAt: number }>;
-  // 🆕 서버가 추적하는 마지막 위치(상태/넉백 계산용)
   x?: number;
   y?: number;
 };
@@ -29,12 +30,11 @@ type Room = {
   max: number;
   status: Status;
   players: Record<string, Player>;
-  visibility: Visibility; // 공개/비공개
-  roomName: string; // 방 이름
+  visibility: Visibility;
+  roomName: string;
   gameMode: string; // "팀전" 등
   createdAt: number;
-  nextTeam: Team; // 다음 배정 예정 팀 ("A" 또는 "B")
-  // 증강 관련 필드 추가
+  nextTeam: Team;   // 다음 배정 예정 팀
   currentRound: number;
   roundResults: Array<{
     round: number;
@@ -48,12 +48,14 @@ type Room = {
   augmentSelections: Array<{
     round: number;
     selections: Record<string, string>; // playerId -> augmentId
-    completionScheduled?: boolean; // 🆕 완료 방송 예약 여부
+    completionScheduled?: boolean;
   }>;
-  // 🆕 라운드 종료 브로드캐스트 지연 중 여부
   isRoundEnding?: boolean;
 };
 
+/** ─────────────────────────────────────────────────────────────
+ *  Const & Utils
+ *  ────────────────────────────────────────────────────────────*/
 const MAX_ROOMS = 5;
 const TEAM_CAP = 3;
 
@@ -68,39 +70,29 @@ const COLOR_PRESETS = [
 
 const isHexColor = (s: string) => /^#?[0-9a-fA-F]{6}$/.test(s);
 const normalizeHex = (s: string) => ("#" + s.replace("#", "")).toUpperCase();
-const getUsedColors = (room: Room) =>
-  new Set(Object.values(room.players).map((p) => (p.color || "").toLowerCase()));
-const pickFirstFreeColor = (room: Room) => {
-  const used = getUsedColors(room);
-  return COLOR_PRESETS.find((c) => !used.has(c.toLowerCase())) ?? "#888888";
-};
 
-const toSafeRoom = (room: Room) => ({
-  roomId: room.roomId,
-  max: room.max,
-  status: room.status,
-  visibility: room.visibility,
-  roomName: room.roomName,
-  gameMode: room.gameMode,
-  createdAt: room.createdAt,
-  players: Object.values(room.players).map((p) => ({
+function safeRoomState(room: Room) {
+  const players = Object.values(room.players).map((p) => ({
     id: p.id,
     nickname: p.nickname,
-    color: p.color,
     team: p.team,
+    color: p.color,
     ready: p.ready,
-  })),
-});
+    health: p.health ?? 100,
+  }));
+  return {
+    roomId: room.roomId,
+    hostId: room.hostId,
+    max: room.max,
+    status: room.status,
+    players,
+    visibility: room.visibility,
+    roomName: room.roomName,
+    gameMode: room.gameMode,
+  };
+}
 
-const app = express();
-app.use(cors());
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
-
-const rooms = new Map<string, Room>();
-
-// ──────────────────────────────────────────────────────────────
-// 맵 스폰 좌표(기본 level1)
+/** 맵 스폰 좌표(기본 level1) */
 const DEFAULT_SPAWNS: Array<{ name: "A" | "B"; x: number; y: number }> = [
   { name: "A", x: 165, y: 350 },
   { name: "B", x: 1755, y: 350 },
@@ -147,35 +139,34 @@ function computeSpawnPositions(room: Room): Record<string, { x: number; y: numbe
   return positions;
 }
 
-function safeRoomState(room: Room) {
-  const players = Object.values(room.players).map((p) => ({
-    id: p.id,
-    nickname: p.nickname,
-    team: p.team,
-    color: p.color,
-    ready: p.ready,
-    health: p.health || 100, // 체력 정보 포함
-  }));
-  return {
-    roomId: room.roomId,
-    hostId: room.hostId,
-    max: room.max,
-    status: room.status,
-    players,
-    // 추가
-    visibility: room.visibility,
-    roomName: room.roomName,
-    gameMode: room.gameMode,
-  };
-}
+/** ─────────────────────────────────────────────────────────────
+ *  App / Server
+ *  ────────────────────────────────────────────────────────────*/
+const app = express();
+app.use(
+  cors({
+    origin: process.env.CLIENT_ORIGIN?.split(",") ?? true, // 운영 시 클라이언트 도메인으로 제한 권장
+    credentials: true,
+  })
+);
 
-// ──────────────────────────────────────────────────────────────
-// Socket.IO
-// ──────────────────────────────────────────────────────────────
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: process.env.CLIENT_ORIGIN?.split(",") ?? "*",
+    methods: ["GET", "POST"],
+  },
+});
+
+const rooms = new Map<string, Room>();
+
+/** ─────────────────────────────────────────────────────────────
+ *  Socket.IO
+ *  ────────────────────────────────────────────────────────────*/
 io.on("connection", (socket) => {
   console.log(`[CONNECT] ${socket.id}`);
 
-  // 방 생성
+  /** 방 생성 */
   socket.on("room:create", (payload: any, ack?: Function) => {
     if (rooms.size >= MAX_ROOMS) {
       return ack?.({ ok: false, error: "ROOM_LIMIT", max: MAX_ROOMS });
@@ -183,56 +174,42 @@ io.on("connection", (socket) => {
 
     const roomId = Math.random().toString(36).slice(2, 7).toUpperCase();
 
+    const hostPlayer: Player = {
+      id: socket.id,
+      nickname: String(payload?.nickname ?? "Player").trim() || "Player",
+      team: "A",
+      ready: false,
+      health: 100,
+      wins: 0,
+    };
+
     const room: Room = {
       roomId,
       hostId: socket.id,
-      max: Math.max(2, Math.min(16, payload.max || 8)),
+      max: Math.max(2, Math.min(16, payload?.max || 8)),
       status: "waiting",
-      players: {},
+      players: { [socket.id]: hostPlayer },
       visibility: payload?.visibility ?? "public",
       roomName: String(payload?.roomName ?? "ROOM"),
       gameMode: String(payload?.gameMode ?? "팀전"),
       createdAt: Date.now(),
-      nextTeam: "A",
+      nextTeam: "B", // 호스트가 A로 들어갔으니 다음은 B
       currentRound: 0,
       roundResults: [],
       augmentSelections: [],
       isRoundEnding: false,
     };
 
-    room.players[socket.id] = {
-      id: socket.id,
-      nickname: String(payload?.nickname ?? "Player"),
-      team: "A",
-      ready: false,
-      health: 100,
-      wins: 0,
-    };
-
-    rooms.set(roomId, room);
-
-    const player: Player = {
-      id: socket.id,
-      nickname: payload.nickname?.trim() || "Player",
-      ready: false,
-      team: "A",
-      health: 100,
-      wins: 0,
-    };
-
     rooms.set(roomId, room);
     socket.join(roomId);
 
-    room.players[socket.id] = player;
-    room.nextTeam = "B";
-
-    console.log(`[ROOM CREATE] ${player.nickname} (${socket.id}) -> ${roomId} (max=${room.max})`);
+    console.log(`[ROOM CREATE] ${hostPlayer.nickname} (${socket.id}) -> ${roomId} (max=${room.max})`);
 
     ack?.({ ok: true, room: safeRoomState(room) });
     io.to(roomId).emit("room:update", safeRoomState(room));
   });
 
-  // 방 목록
+  /** 방 목록 */
   socket.on("room:list", (_: {}, ack?: Function) => {
     const list = [...rooms.values()]
       .filter((r) => r.visibility === "public" && r.status === "waiting")
@@ -251,7 +228,7 @@ io.on("connection", (socket) => {
     ack?.({ ok: true, rooms: list });
   });
 
-  // 방 정보 조회
+  /** 방 정보 조회 */
   socket.on("room:info", (payload: { roomId: string }, ack?: Function) => {
     const room = rooms.get(payload.roomId);
     if (!room) return ack?.({ ok: false, error: "NOT_FOUND" });
@@ -261,7 +238,6 @@ io.on("connection", (socket) => {
   function pickTeamWithAlternation(room: Room, cap: number): Team | null {
     const countA = Object.values(room.players).filter((p) => p.team === "A").length;
     const countB = Object.values(room.players).filter((p) => p.team === "B").length;
-
     const order: Team[] = room.nextTeam === "A" ? ["A", "B"] : ["B", "A"];
 
     for (const t of order) {
@@ -277,84 +253,73 @@ io.on("connection", (socket) => {
     return null;
   }
 
-  // 방 참가
+  /** 방 참가 */
   socket.on("room:join", (payload: any, ack?: Function) => {
     const { roomId, nickname } = payload || {};
     const room = rooms.get(roomId);
 
     if (!room) {
-      console.log(`[ROOM JOIN FAIL] ${socket.id} -> ${payload.roomId} (NOT_FOUND)`);
+      console.log(`[ROOM JOIN FAIL] ${socket.id} -> ${roomId} (NOT_FOUND)`);
       return ack?.({ ok: false, error: "NOT_FOUND" });
     }
     if (room.status !== "waiting") {
-      console.log(`[ROOM JOIN FAIL] ${socket.id} -> ${payload.roomId} (IN_PROGRESS)`);
+      console.log(`[ROOM JOIN FAIL] ${socket.id} -> ${roomId} (IN_PROGRESS)`);
       return ack?.({ ok: false, error: "IN_PROGRESS" });
     }
     if (Object.keys(room.players).length >= room.max) {
-      console.log(`[ROOM JOIN FAIL] ${socket.id} -> ${payload.roomId} (FULL)`);
+      console.log(`[ROOM JOIN FAIL] ${socket.id} -> ${roomId} (FULL)`);
       return ack?.({ ok: false, error: "FULL" });
     }
 
     socket.join(roomId);
 
-    const n = String(nickname ?? "Player");
-    const ex = room.players[socket.id];
-
-    if (ex) {
-      ex.nickname = n;
-      if (ex.health == null) ex.health = 100;
-      if (ex.wins == null) ex.wins = 0;
-    } else {
-      room.players[socket.id] = {
+    // 기존 참가자면 정보 갱신, 아니면 새로 생성
+    let p = room.players[socket.id];
+    if (!p) {
+      p = {
         id: socket.id,
-        nickname: n,
-        team: "A",
+        nickname: String(nickname ?? "Player").trim() || "Player",
         ready: false,
         health: 100,
         wins: 0,
       };
-    }
-
-    const player: Player = {
-      id: socket.id,
-      nickname: (payload.nickname ?? "Player").trim() || "Player",
-      ready: false,
-    };
-
-    if (room.gameMode === "팀전") {
-      const team = pickTeamWithAlternation(room, TEAM_CAP);
-      if (!team) {
-        return ack?.({ ok: false, error: "FULL" });
+      if (room.gameMode === "팀전") {
+        const team = pickTeamWithAlternation(room, TEAM_CAP);
+        if (!team) return ack?.({ ok: false, error: "FULL" });
+        p.team = team;
       }
-      player.team = team;
+      room.players[socket.id] = p;
+    } else {
+      p.nickname = String(nickname ?? p.nickname);
+      if (p.health == null) p.health = 100;
+      if (p.wins == null) p.wins = 0;
+      if (room.gameMode === "팀전" && !p.team) {
+        const team = pickTeamWithAlternation(room, TEAM_CAP);
+        if (team) p.team = team;
+      }
     }
 
-    player.health = 100;
-    player.wins = player.wins ?? 0;
-    room.players[socket.id] = player;
-
-    console.log("palyer:", player);
     console.log(
-      `[ROOM JOIN] ${player.nickname} (${socket.id}) -> ${payload.roomId} (${Object.keys(room.players).length}/${room.max})`
+      `[ROOM JOIN] ${p.nickname} (${socket.id}) -> ${roomId} (${Object.keys(room.players).length}/${room.max})`
     );
 
     ack?.({ ok: true, room: safeRoomState(room) });
     io.to(roomId).emit("room:update", safeRoomState(room));
     io.to(roomId).emit("player:joined", {
-      players: Object.values(room.players).map((player) => ({
-        ...player,
-        health: player.health || 100,
+      players: Object.values(room.players).map((pl) => ({
+        ...pl,
+        health: pl.health ?? 100,
       })),
     });
   });
 
-  // 방 나가기
+  /** 방 나가기 */
   socket.on("room:leave", (_: {}, ack?: Function) => {
     const left = leaveAllRooms(socket);
     ack?.({ ok: true, left });
   });
 
-  // Ready 토글
+  /** Ready 토글 */
   socket.on("player:ready", (_: {}, ack?: Function) => {
     const rid = currentRoomIdOf(socket);
     if (!rid) return ack?.({ ok: false });
@@ -378,53 +343,50 @@ io.on("connection", (socket) => {
     ack?.({ ok: true, ready: p.ready });
   });
 
-  // 팀/색 선택
-  socket.on(
-    "player:select",
-    (payload: { team?: Team; color?: string }, ack?: Function) => {
-      const rid = currentRoomIdOf(socket);
-      if (!rid) return ack?.({ ok: false });
-      const room = rooms.get(rid);
-      if (!room) return ack?.({ ok: false });
-      const p = room.players[socket.id];
-      if (!p) return ack?.({ ok: false });
+  /** 팀/색 선택 */
+  socket.on("player:select", (payload: { team?: Team; color?: string }, ack?: Function) => {
+    const rid = currentRoomIdOf(socket);
+    if (!rid) return ack?.({ ok: false });
+    const room = rooms.get(rid);
+    if (!room) return ack?.({ ok: false });
+    const p = room.players[socket.id];
+    if (!p) return ack?.({ ok: false });
 
-      if (payload.team) p.team = payload.team;
+    if (payload.team) p.team = payload.team;
 
-      if (payload.color) {
-        const used = new Set(
-          Object.values(room.players)
-            .map((x) => x.color)
-            .filter(Boolean) as string[]
-        );
-        if (!used.has(payload.color)) p.color = payload.color; // 중복 최소 방지
-      }
-
-      console.log(
-        `[SELECT] ${p.nickname} (${socket.id}) -> room ${rid} team=${p.team ?? "-"} color=${p.color ?? "-"}`
+    if (payload.color) {
+      const hex = normalizeHex(payload.color);
+      if (!isHexColor(hex)) return ack?.({ ok: false, error: "INVALID_COLOR" });
+      const used = new Set(
+        Object.values(room.players).map((x) => (x.color || "").toLowerCase())
       );
-
-      io.to(rid).emit("room:update", safeRoomState(room));
-      ack?.({ ok: true });
+      const myCurrent = (p.color || "").toLowerCase();
+      if (used.has(hex.toLowerCase()) && hex.toLowerCase() !== myCurrent) {
+        return ack?.({ ok: false, error: "COLOR_TAKEN" });
+      }
+      p.color = hex;
     }
-  );
 
-  // 플레이어 색
-  socket.on("player:setColor", ({ roomId, color }, ack) => {
+    console.log(
+      `[SELECT] ${p.nickname} (${socket.id}) -> room ${rid} team=${p.team ?? "-"} color=${p.color ?? "-"}`
+    );
+
+    io.to(rid).emit("room:update", safeRoomState(room));
+    ack?.({ ok: true });
+  });
+
+  /** 플레이어 색 (직접 설정) */
+  socket.on("player:setColor", ({ roomId, color }, ack?: Function) => {
     const room = rooms.get(roomId);
     if (!room) return ack?.({ ok: false, error: "NO_ROOM" });
 
     const me = room.players[socket.id];
     if (!me) return ack?.({ ok: false, error: "NOT_IN_ROOM" });
 
-    const isHex = /^#?[0-9a-fA-F]{6}$/.test(color || "");
-    if (!isHex) return ack?.({ ok: false, error: "INVALID_COLOR" });
+    if (!isHexColor(color || "")) return ack?.({ ok: false, error: "INVALID_COLOR" });
+    const hex = normalizeHex(color);
 
-    const hex = ("#" + String(color).replace("#", "")).toUpperCase();
-
-    const used = new Set(
-      Object.values(room.players).map((p) => (p.color || "").toLowerCase())
-    );
+    const used = new Set(Object.values(room.players).map((p) => (p.color || "").toLowerCase()));
     const myCurrent = (me.color || "").toLowerCase();
     if (used.has(hex.toLowerCase()) && hex.toLowerCase() !== myCurrent) {
       return ack?.({ ok: false, error: "COLOR_TAKEN" });
@@ -432,13 +394,10 @@ io.on("connection", (socket) => {
 
     me.color = hex;
     ack?.({ ok: true });
-
-    io.to(roomId).emit("player:updated", {
-      players: Object.values(room.players),
-    });
+    io.to(roomId).emit("player:updated", { players: Object.values(room.players) });
   });
 
-  // 호스트만 게임 시작
+  /** 호스트만 게임 시작 */
   socket.on("game:start", (_: {}, ack?: Function) => {
     const rid = currentRoomIdOf(socket);
     if (!rid) return ack?.({ ok: false, error: "NO_ROOM" });
@@ -458,7 +417,7 @@ io.on("connection", (socket) => {
 
     const playersWithHealth = Object.values(room.players).map((player) => ({
       ...player,
-      health: player.health || 100,
+      health: player.health ?? 100,
     }));
 
     const spawnPlan: Record<string, number> = {};
@@ -482,8 +441,8 @@ io.on("connection", (socket) => {
 
     Object.entries(room.players).forEach(([playerId, player]) => {
       io.to(rid).emit("game:healthUpdate", {
-        playerId: playerId,
-        health: player.health || 100,
+        playerId,
+        health: player.health ?? 100,
         damage: 0,
         timestamp: Date.now(),
       });
@@ -491,7 +450,7 @@ io.on("connection", (socket) => {
     ack?.({ ok: true });
   });
 
-  // 입력 중계
+  /** 입력 중계 */
   socket.on(
     "input:move",
     (data: { x: number; y: number; vx: number; vy: number; facing: "L" | "R" }) => {
@@ -512,187 +471,171 @@ io.on("connection", (socket) => {
   socket.on("input:shoot", (data: { x: number; y: number; angle: number }) => {
     const rid = currentRoomIdOf(socket);
     if (!rid) return;
-
     console.log(`[SHOOT] ${socket.id} -> room ${rid}: angle ${data.angle}`);
-
-    socket.to(rid).emit("state:shoot", {
-      id: socket.id,
-      ...data,
-      t: Date.now(),
-    });
+    socket.to(rid).emit("state:shoot", { id: socket.id, ...data, t: Date.now() });
   });
 
-  // 총알 피격
-  socket.on(
-    "game:bulletHit",
-    (payload: { roomId: string; playerId: string; hit: any }) => {
-      const { roomId, hit } = payload || {};
-      if (!roomId || !hit) return;
+  /** 총알 피격 */
+  socket.on("game:bulletHit", (payload: { roomId: string; playerId: string; hit: any }) => {
+    const { roomId, hit } = payload || {};
+    if (!roomId || !hit) return;
 
-      const room = rooms.get(roomId);
-      if (room && room.players[hit.targetPlayerId]) {
-        const target = room.players[hit.targetPlayerId];
-        if (!target) return;
-        const currentHealth = target.health ?? 100;
+    const room = rooms.get(roomId);
+    if (room && room.players[hit.targetPlayerId]) {
+      const target = room.players[hit.targetPlayerId];
+      if (!target) return;
+      const currentHealth = target.health ?? 100;
+      if (currentHealth <= 0) return;
 
-        if (currentHealth <= 0) {
-          return;
-        }
+      const shooter = room.players[payload.playerId];
+      const damage = hit.damage ?? 25;
+      const newHealth = Math.max(0, currentHealth - damage);
+      target.health = newHealth;
 
-        const shooter = room.players[payload.playerId];
-        let damage = hit.damage ?? 25;
-        const newHealth = Math.max(0, currentHealth - damage);
+      io.to(roomId).emit("game:healthUpdate", {
+        playerId: hit.targetPlayerId,
+        health: newHealth,
+        damage,
+        timestamp: Date.now(),
+      });
 
-        target.health = newHealth;
+      io.to(roomId).emit("game:event", {
+        type: "showHealthBar",
+        playerId: hit.targetPlayerId,
+        data: { playerId: hit.targetPlayerId, health: newHealth, duration: 3000 },
+      });
 
-        io.to(roomId).emit("game:healthUpdate", {
-          playerId: hit.targetPlayerId,
-          health: newHealth,
-          damage: damage,
-          timestamp: Date.now(),
-        });
-
-        io.to(roomId).emit("game:event", {
-          type: "showHealthBar",
-          playerId: hit.targetPlayerId,
-          data: { playerId: hit.targetPlayerId, health: newHealth, duration: 3000 },
-        });
-
-        if (shooter?.augments && shooter.augments["독걸려랑"] && newHealth > 0) {
-          const victimId = hit.targetPlayerId;
-          let ticks = 3;
-          const dot = 5;
-          const timer = setInterval(() => {
-            const r = rooms.get(roomId);
-            if (!r) return clearInterval(timer);
-            const v = r.players[victimId];
-            if (!v) return clearInterval(timer);
-            const h = v.health ?? 100;
-            if (h <= 0) return clearInterval(timer);
-            const nh = Math.max(0, h - dot);
-            v.health = nh;
-            io.to(roomId).emit("game:healthUpdate", {
-              playerId: victimId,
-              health: nh,
-              damage: dot,
-              timestamp: Date.now(),
-            });
-            io.to(roomId).emit("game:event", {
-              type: "showHealthBar",
-              playerId: victimId,
-              data: { playerId: victimId, health: nh, duration: 3000 },
-            });
-            ticks -= 1;
-            if (nh <= 0 || ticks <= 0) clearInterval(timer);
-          }, 1000);
-        }
-
-        if (shooter?.augments && shooter.augments["벌이야!"] && newHealth > 0) {
-          const victimId = hit.targetPlayerId;
-          let ticks = 3;
-          const dot = 5;
-          const timer2 = setInterval(() => {
-            const r = rooms.get(roomId);
-            if (!r) return clearInterval(timer2);
-            const v = r.players[victimId];
-            if (!v) return clearInterval(timer2);
-            const h = v.health ?? 100;
-            if (h <= 0) return clearInterval(timer2);
-            const nh = Math.max(0, h - dot);
-            v.health = nh;
-            io.to(roomId).emit("game:healthUpdate", {
-              playerId: victimId,
-              health: nh,
-              damage: dot,
-              timestamp: Date.now(),
-            });
-            ticks -= 1;
-            if (nh <= 0 || ticks <= 0) clearInterval(timer2);
-          }, 2000);
-        }
-
-        if (shooter?.augments) {
-          if (shooter.augments["끈적여요"]) {
-            io.to(roomId).emit("game:event", {
-              type: "status",
-              playerId: hit.targetPlayerId,
-              data: { status: "slow", ms: 1500, multiplier: 0.5 },
-            });
-          }
-
-          if (shooter.augments["앗따거"]) {
-            io.to(roomId).emit("game:event", {
-              type: "status",
-              playerId: hit.targetPlayerId,
-              data: { status: "stun", ms: 1000 },
-            });
-          }
-
-          if (shooter.augments["잠깐만"]) {
-            const victim = room.players[hit.targetPlayerId];
-            const px = victim?.x ?? hit.x;
-            const py = victim?.y ?? hit.y;
-            let dx = (px as number) - hit.x;
-            let dy = (py as number) - hit.y;
-            const len = Math.sqrt(dx * dx + dy * dy) || 1;
-            dx /= len;
-            dy /= len;
-            const impulseBase = 400 * 2;
-            io.to(roomId).emit("game:event", {
-              type: "status",
-              playerId: hit.targetPlayerId,
-              data: { status: "knockback", vx: dx * impulseBase, vy: dy * impulseBase, ms: 0 },
-            });
-          }
-
-          if (shooter.augments["기생충"]) {
-            const healer = room.players[payload.playerId];
-            const old = healer?.health ?? 100;
-            const nh = Math.min(100, old + 15);
-            if (healer) healer.health = nh;
-            io.to(roomId).emit("game:healthUpdate", {
-              playerId: payload.playerId,
-              health: nh,
-              damage: 0,
-              timestamp: Date.now(),
-            });
-          }
-        }
-
-        if (newHealth <= 0) {
-          io.to(roomId).emit("game:event", {
-            type: "dead",
-            playerId: hit.targetPlayerId,
-            data: { x: hit.x, y: hit.y },
+      // 지속피해/슬로우/스턴/넉백/흡혈 증강 처리
+      if (shooter?.augments && shooter.augments["독걸려랑"] && newHealth > 0) {
+        const victimId = hit.targetPlayerId;
+        let ticks = 3;
+        const dot = 5;
+        const timer = setInterval(() => {
+          const r = rooms.get(roomId);
+          if (!r) return clearInterval(timer);
+          const v = r.players[victimId];
+          if (!v) return clearInterval(timer);
+          const h = v.health ?? 100;
+          if (h <= 0) return clearInterval(timer);
+          const nh = Math.max(0, h - dot);
+          v.health = nh;
+          io.to(roomId).emit("game:healthUpdate", {
+            playerId: victimId,
+            health: nh,
+            damage: dot,
+            timestamp: Date.now(),
           });
-        }
-
-        const { shouldEnd, winners } = evaluateRoundEnd(room);
-        if (shouldEnd && !room.isRoundEnding) {
-          room.isRoundEnding = true;
-          setTimeout(() => {
-            winners.forEach((pid) => {
-              const wp = room.players[pid];
-              if (wp) wp.wins = (wp.wins || 0) + 1;
-            });
-            endRound(io, room);
-            room.isRoundEnding = false;
-          }, 3000);
-        }
-
-        console.log(
-          `[HEALTH] ${hit.targetPlayerId}: ${currentHealth} -> ${newHealth} (-${hit.damage})`
-        );
-
-        console.log(
-          `[ROOM HEALTH] Room ${roomId} players health:`,
-          Object.entries(room.players).map(([id, p]) => `${p.nickname}: ${p.health}`)
-        );
+          io.to(roomId).emit("game:event", {
+            type: "showHealthBar",
+            playerId: victimId,
+            data: { playerId: victimId, health: nh, duration: 3000 },
+          });
+          ticks -= 1;
+          if (nh <= 0 || ticks <= 0) clearInterval(timer);
+        }, 1000);
       }
 
-      io.to(roomId).emit("game:bulletHit", hit);
+      if (shooter?.augments && shooter.augments["벌이야!"] && newHealth > 0) {
+        const victimId = hit.targetPlayerId;
+        let ticks = 3;
+        const dot = 5;
+        const timer2 = setInterval(() => {
+          const r = rooms.get(roomId);
+          if (!r) return clearInterval(timer2);
+          const v = r.players[victimId];
+          if (!v) return clearInterval(timer2);
+          const h = v.health ?? 100;
+          if (h <= 0) return clearInterval(timer2);
+          const nh = Math.max(0, h - dot);
+          v.health = nh;
+          io.to(roomId).emit("game:healthUpdate", {
+            playerId: victimId,
+            health: nh,
+            damage: dot,
+            timestamp: Date.now(),
+          });
+          ticks -= 1;
+          if (nh <= 0 || ticks <= 0) clearInterval(timer2);
+        }, 2000);
+      }
+
+      if (shooter?.augments) {
+        if (shooter.augments["끈적여요"]) {
+          io.to(roomId).emit("game:event", {
+            type: "status",
+            playerId: hit.targetPlayerId,
+            data: { status: "slow", ms: 1500, multiplier: 0.5 },
+          });
+        }
+        if (shooter.augments["앗따거"]) {
+          io.to(roomId).emit("game:event", {
+            type: "status",
+            playerId: hit.targetPlayerId,
+            data: { status: "stun", ms: 1000 },
+          });
+        }
+        if (shooter.augments["잠깐만"]) {
+          const victim = room.players[hit.targetPlayerId];
+          const px = victim?.x ?? hit.x;
+          const py = victim?.y ?? hit.y;
+          let dx = (px as number) - hit.x;
+          let dy = (py as number) - hit.y;
+          const len = Math.sqrt(dx * dx + dy * dy) || 1;
+          dx /= len;
+          dy /= len;
+          const impulseBase = 400 * 2;
+          io.to(roomId).emit("game:event", {
+            type: "status",
+            playerId: hit.targetPlayerId,
+            data: { status: "knockback", vx: dx * impulseBase, vy: dy * impulseBase, ms: 0 },
+          });
+        }
+        if (shooter.augments["기생충"]) {
+          const healer = room.players[payload.playerId];
+          const old = healer?.health ?? 100;
+          const nh = Math.min(100, old + 15);
+          if (healer) healer.health = nh;
+          io.to(roomId).emit("game:healthUpdate", {
+            playerId: payload.playerId,
+            health: nh,
+            damage: 0,
+            timestamp: Date.now(),
+          });
+        }
+      }
+
+      if (newHealth <= 0) {
+        io.to(roomId).emit("game:event", {
+          type: "dead",
+          playerId: hit.targetPlayerId,
+          data: { x: hit.x, y: hit.y },
+        });
+      }
+
+      const { shouldEnd, winners } = evaluateRoundEnd(room);
+      if (shouldEnd && !room.isRoundEnding) {
+        room.isRoundEnding = true;
+        setTimeout(() => {
+          winners.forEach((pid) => {
+            const wp = room.players[pid];
+            if (wp) wp.wins = (wp.wins || 0) + 1;
+          });
+          endRound(io, room);
+          room.isRoundEnding = false;
+        }, 3000);
+      }
+
+      console.log(
+        `[HEALTH] ${hit.targetPlayerId}: ${currentHealth} -> ${newHealth} (-${hit.damage})`
+      );
+      console.log(
+        `[ROOM HEALTH] Room ${roomId} players health:`,
+        Object.entries(room.players).map(([id, p]) => `${p.nickname}: ${p.health}`)
+      );
     }
-  );
+
+    io.to(roomId).emit("game:bulletHit", hit);
+  });
 
   socket.on("pose:update", (payload: { roomId: string; pose: any }) => {
     const { roomId, pose } = payload || {};
@@ -712,20 +655,16 @@ io.on("connection", (socket) => {
     socket.to(roomId).emit("game:event", event);
   });
 
-  // 채팅
+  /** 채팅 */
   socket.on("chat:send", (data: { message: string }) => {
     const rid = currentRoomIdOf(socket);
     if (!rid) return;
     const msg = (data.message || "").slice(0, 200);
     console.log(`[CHAT] room ${rid} ${socket.id}: ${msg}`);
-    io.to(rid).emit("chat:message", {
-      id: socket.id,
-      message: msg,
-      t: Date.now(),
-    });
+    io.to(rid).emit("chat:message", { id: socket.id, message: msg, t: Date.now() });
   });
 
-  // 라운드 종료 → 결과 표출 → 증강 선택
+  /** 라운드 종료 → 결과 → 증강 선택 */
   socket.on(
     "round:end",
     (
@@ -767,105 +706,96 @@ io.on("connection", (socket) => {
     }
   );
 
-  // 증강 선택 처리
-  socket.on(
-    "augment:select",
-    (payload: { augmentId: string; round: number }, ack?: Function) => {
-      const rid = currentRoomIdOf(socket);
-      if (!rid) return ack?.({ ok: false, error: "NO_ROOM" });
+  /** 증강 선택 처리 */
+  socket.on("augment:select", (payload: { augmentId: string; round: number }, ack?: Function) => {
+    const rid = currentRoomIdOf(socket);
+    if (!rid) return ack?.({ ok: false, error: "NO_ROOM" });
 
-      const room = rooms.get(rid);
-      if (!room) return ack?.({ ok: false, error: "NO_ROOM" });
+    const room = rooms.get(rid);
+    if (!room) return ack?.({ ok: false, error: "NO_ROOM" });
 
-      let roundSelection = room.augmentSelections.find((s) => s.round === payload.round);
+    let roundSelection = room.augmentSelections.find((s) => s.round === payload.round);
+    if (!roundSelection) {
+      roundSelection = { round: payload.round, selections: {}, completionScheduled: false };
+      room.augmentSelections.push(roundSelection);
+    }
 
-      if (!roundSelection) {
-        roundSelection = {
-          round: payload.round,
-          selections: {},
-          completionScheduled: false,
-        };
-        room.augmentSelections.push(roundSelection);
-      }
+    roundSelection.selections[socket.id] = payload.augmentId;
+    console.log(`[AUGMENT SELECT] room ${rid}, round ${payload.round}, player ${socket.id} -> ${payload.augmentId}`);
 
-      roundSelection.selections[socket.id] = payload.augmentId;
+    io.to(rid).emit("augment:progress", {
+      round: payload.round,
+      selections: roundSelection.selections,
+      selectedCount: Object.keys(roundSelection.selections).length,
+      totalPlayers: Object.keys(room.players).length,
+    });
 
-      console.log(
-        `[AUGMENT SELECT] room ${rid}, round ${payload.round}, player ${socket.id} -> ${payload.augmentId}`
-      );
+    const allPlayersSelected = Object.values(room.players).every(
+      (player) => roundSelection!.selections[player.id]
+    );
 
-      io.to(rid).emit("augment:progress", {
+    if (allPlayersSelected && !roundSelection.completionScheduled) {
+      roundSelection.completionScheduled = true;
+      console.log(`[AUGMENT COMPLETE] room ${rid}, round ${payload.round} - 모든 플레이어 선택 완료`);
+
+      io.to(rid).emit("augment:complete", {
         round: payload.round,
         selections: roundSelection.selections,
-        selectedCount: Object.keys(roundSelection.selections).length,
-        totalPlayers: Object.keys(room.players).length,
       });
 
-      const allPlayersSelected = Object.values(room.players).every(
-        (player) => roundSelection!.selections[player.id]
-      );
+      // 적용 및 스냅샷 브로드캐스트
+      Object.entries(roundSelection.selections).forEach(([pid, augId]) => {
+        const p = room.players[pid];
+        if (!p) return;
+        if (!p.augments) p.augments = {};
+        p.augments[augId] = { id: augId, startedAt: Date.now() };
+      });
 
-      if (allPlayersSelected && !roundSelection.completionScheduled) {
-        roundSelection.completionScheduled = true;
-        console.log(`[AUGMENT COMPLETE] room ${rid}, round ${payload.round} - 모든 플레이어 선택 완료`);
+      io.to(rid).emit("augment:snapshot", {
+        players: Object.values(room.players).map((p) => ({
+          id: p.id,
+          augments: p.augments || {},
+        })),
+        round: payload.round,
+        t: Date.now(),
+      });
 
-        io.to(rid).emit("augment:complete", {
-          round: payload.round,
-          selections: roundSelection.selections,
+      // 체력 리셋 & 리스폰 & alive
+      Object.values(room.players).forEach((p) => {
+        p.health = 100;
+        io.to(rid).emit("game:healthUpdate", {
+          playerId: p.id,
+          health: 100,
+          damage: 0,
+          timestamp: Date.now(),
         });
+      });
 
-        Object.entries(roundSelection.selections).forEach(([pid, augId]) => {
-          const p = room.players[pid];
-          if (!p) return;
-          if (!p.augments) p.augments = {};
-          p.augments[augId] = { id: augId, startedAt: Date.now() };
+      const playerEntries = Object.entries(room.players);
+      playerEntries.forEach(([playerId, _player], index) => {
+        io.to(rid).emit("game:event", {
+          type: "respawnAll",
+          playerId: "server",
+          data: { round: payload.round, spawnIndex: index, targetPlayerId: playerId },
         });
+      });
 
-        io.to(rid).emit("augment:snapshot", {
-          players: Object.values(room.players).map((p) => ({
-            id: p.id,
-            augments: p.augments || {},
-          })),
-          round: payload.round,
-          t: Date.now(),
+      Object.values(room.players).forEach((p) => {
+        io.to(rid).emit("game:event", {
+          type: "alive",
+          playerId: p.id,
+          data: { round: payload.round },
         });
+      });
 
-        Object.values(room.players).forEach((p) => {
-          p.health = 100;
-          io.to(rid).emit("game:healthUpdate", {
-            playerId: p.id,
-            health: 100,
-            damage: 0,
-            timestamp: Date.now(),
-          });
-        });
-
-        const playerEntries = Object.entries(room.players);
-        playerEntries.forEach(([playerId, player], index) => {
-          io.to(rid).emit("game:event", {
-            type: "respawnAll",
-            playerId: "server",
-            data: { round: payload.round, spawnIndex: index, targetPlayerId: playerId },
-          });
-        });
-
-        Object.values(room.players).forEach((p) => {
-          io.to(rid).emit("game:event", {
-            type: "alive",
-            playerId: p.id,
-            data: { round: payload.round },
-          });
-        });
-
-        roundSelection.selections = {};
-        setTimeout(() => {
-          roundSelection!.completionScheduled = false;
-        }, 2000);
-      }
-
-      ack?.({ ok: true, allSelected: allPlayersSelected });
+      roundSelection.selections = {};
+      setTimeout(() => {
+        roundSelection!.completionScheduled = false;
+      }, 2000);
     }
-  );
+
+    ack?.({ ok: true, allSelected: allPlayersSelected });
+  });
 
   socket.on("disconnect", () => {
     console.log(`[DISCONNECT] ${socket.id}`);
@@ -873,9 +803,9 @@ io.on("connection", (socket) => {
   });
 });
 
-// ──────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────
+/** ─────────────────────────────────────────────────────────────
+ *  Helpers
+ *  ────────────────────────────────────────────────────────────*/
 function currentRoomIdOf(socket: any): string | null {
   const rid = [...socket.rooms].find((r) => r !== socket.id);
   return rid ?? null;
@@ -916,9 +846,7 @@ function leaveAllRooms(socket: any) {
   return left;
 }
 
-// ──────────────────────────────────────────────────────────────
-// 라운드 종료 판정 및 처리 헬퍼
-// ──────────────────────────────────────────────────────────────
+/** 라운드 종료 판정 */
 function evaluateRoundEnd(room: Room): { shouldEnd: boolean; winners: string[] } {
   const players = Object.values(room.players);
   const alive = players.filter((p) => (p.health ?? 100) > 0);
@@ -984,11 +912,19 @@ function endRound(io: Server, room: Room) {
   }
 }
 
-// ──────────────────────────────────────────────────────────────
-// HTTP
-// ──────────────────────────────────────────────────────────────
+/** ─────────────────────────────────────────────────────────────
+ *  HTTP (Health checks)
+ *  ────────────────────────────────────────────────────────────*/
+// ✅ 모니터가 200을 받을 수 있도록 루트에 OK 반환
+app.get("/", (_req, res) => res.status(200).send("OK"));
+// 별칭 헬스체크
+app.get("/healthz", (_req, res) => res.status(200).json({ ok: true, t: Date.now() }));
+app.head("/healthz", (_req, res) => res.status(200).end());
+// 기존 호환
 app.get("/health", (_req, res) => res.json({ ok: true, t: Date.now() }));
 
-// ✅ Render 호환: 환경 포트 사용
+/** ─────────────────────────────────────────────────────────────
+ *  Start
+ *  ────────────────────────────────────────────────────────────*/
 const PORT = Number(process.env.PORT || 4000);
-server.listen(PORT, "0.0.0.0", () => console.log(`Socket.IO server on :${PORT}`));
+httpServer.listen(PORT, "0.0.0.0", () => console.log(`Socket.IO server on :${PORT}`));
